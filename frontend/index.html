@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cozmo IA - Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <!-- CDN Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+    <div class="background-effects">
+        <div class="glow-orb orb-1"></div>
+        <div class="glow-orb orb-2"></div>
+    </div>
+
+    <div class="container">
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">🤖</span>
+                <h1>Cozmo <span class="highlight">IA</span></h1>
+            </div>
+            <div class="status-indicator">
+                <div class="led" id="connection-led"></div>
+                <span id="connection-text">Déconnecté</span>
+            </div>
+        </header>
+
+        <main class="grid-layout">
+            <!-- Colonne Gauche : Vidéo et Odométrie -->
+            <section class="left-panel">
+                <div class="glass-panel video-container">
+                    <div class="panel-header">
+                        <h2>Caméra</h2>
+                        <div class="header-badges">
+                            <span class="badge action-badge" id="current-action-badge">💤 En attente</span>
+                            <span class="badge" id="state-badge">Arrêt</span>
+                        </div>
+                    </div>
+                    <div class="video-wrapper">
+                        <img id="video-feed" src="" alt="Flux vidéo en attente..." />
+                        <div class="hud">
+                            <div id="cliff-warning" class="warning-overlay hidden">
+                                ⚠️ FALAISE DÉTECTÉE
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="glass-panel odometry-container">
+                    <div class="panel-header">
+                        <h2>Télémétrie</h2>
+                    </div>
+                    <div class="stats-grid">
+                        <div class="stat-box">
+                            <span class="stat-label">Position X</span>
+                            <span class="stat-value" id="odom-x">0.00</span>
+                            <span class="stat-unit">cm</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Position Y</span>
+                            <span class="stat-value" id="odom-y">0.00</span>
+                            <span class="stat-unit">cm</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Orientation</span>
+                            <span class="stat-value" id="odom-cap">0.0</span>
+                            <span class="stat-unit">°</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Colonne Droite : Logs IA et Contrôles -->
+            <section class="right-panel">
+                <div class="glass-panel ai-container">
+                    <div class="panel-header">
+                        <h2>Raisonnement IA</h2>
+                    </div>
+                    <div class="ai-logs" id="ai-logs">
+                        <!-- Les logs s'injectent ici -->
+                    </div>
+                </div>
+
+                <div class="glass-panel controls-container">
+                    <div class="panel-header">
+                        <h2>Terminal & Contrôle</h2>
+                    </div>
+                    <div class="terminal">
+                        <div class="terminal-output" id="terminal-output">
+                            <div class="log-entry system">Système prêt. Entrez une commande.</div>
+                        </div>
+                        <form id="command-form" class="command-input">
+                            <span class="prompt-arrow">❯</span>
+                            <input type="text" id="command-input" placeholder="Tape ta commande pour Cozmo..." autocomplete="off" />
+                            <button type="submit" class="btn-primary">Envoyer</button>
+                        </form>
+                    </div>
+                    <div class="quick-actions">
+                        <button id="btn-map3d" class="btn-action map-btn">🗺️ Carte 3D</button>
+                        <button id="btn-stop" class="btn-action danger">🛑 Stop Urgence</button>
+                        <button id="btn-left" class="btn-action">⬅️ Gauche 90°</button>
+                        <button id="btn-forward" class="btn-action">⬆️ Avancer 10cm</button>
+                        <button id="btn-right" class="btn-action">➡️ Droite 90°</button>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Overlay 3D SLAM Map -->
+    <div id="map3d-overlay" class="hidden">
+        <div class="map3d-header">
+            <h2>🌍 Cartographie SLAM 3D en direct</h2>
+            <button id="btn-close-map" class="btn-action danger">✖ Fermer</button>
+        </div>
+        
+        <div class="map3d-ui-panel glass-panel">
+            <div class="ui-group">
+                <label class="ui-label">
+                    <input type="checkbox" id="follow-cam-toggle" />
+                    🎥 Suivre Cozmo
+                </label>
+            </div>
+            <div class="ui-group">
+                <h3>🧭 Navigations</h3>
+                <div id="sessions-list">
+                    <!-- Sessions checkboxes injected here -->
+                    <div class="session-empty">Aucune exploration en cours</div>
+                </div>
+            </div>
+        </div>
+
+        <div id="map3d-canvas"></div>
+    </div>
+
+    <!-- Photo Modal -->
+    <div id="photo-modal" class="hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <button id="btn-close-modal" class="btn-close">✖</button>
+            <img id="modal-image" src="" alt="Mémoire visuelle" />
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+    <script src="map3d.js"></script>
+</body>
+</html>
