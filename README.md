@@ -654,7 +654,3 @@ Ce projet est distribué sous licence MIT. Voir le fichier `LICENSE` pour plus d
 - **Google Gemini** — Intelligence artificielle multimodale
 - **Three.js** — Rendu 3D WebGL pour la carte
 - **FastAPI** — Framework web Python asynchrone
-
----
-
-*Projet développé avec ❤️ pour explorer les frontières entre robotique grand public et IA embarquée.*
