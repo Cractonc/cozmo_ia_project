@@ -19,6 +19,8 @@ import functools
 import base64
 import io
 import math
+import time
+import numpy as np
 import speech_recognition as sr
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
@@ -30,6 +32,18 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # Module de navigation Waypoint (Stop, Look, Think, Act + Fail-Safe)
 from navigation import lancer_exploration
+
+# Module de navigation hybride Phase 4 (NN + Gemini)
+from hybrid_navigation import lancer_exploration_hybride, find_latest_model
+
+# Import conditionnel de PyTorch pour le mode autonome NN
+TORCH_AVAILABLE = False
+try:
+    import torch
+    from model import CozmoNN
+    TORCH_AVAILABLE = True
+except ImportError:
+    pass
 
 # =====================================================================
 # --- CONFIGURATION ---
@@ -44,20 +58,486 @@ historique_conversation = []
 app = FastAPI()
 app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
 
+# Endpoint pour récupérer la liste des modèles disponibles
+@app.get("/api/models")
+def get_models():
+    models_dir = "models"
+    if not os.path.exists(models_dir):
+        return []
+    
+    models_list = []
+    for f in os.listdir(models_dir):
+        if f.endswith(".pt"):
+            filepath = os.path.join(models_dir, f)
+            stat_info = os.stat(filepath)
+            
+            # Read metadata if exists
+            metadata_path = os.path.join(models_dir, f.replace(".pt", ".json"))
+            display_name = f[:-3]
+            version = ""
+            parameters = ""
+            
+            if os.path.exists(metadata_path):
+                try:
+                    with open(metadata_path, 'r') as mf:
+                        meta = json.load(mf)
+                        display_name = meta.get("displayName", display_name)
+                        version = meta.get("version", "")
+                        parameters = meta.get("parameters", "")
+                except Exception:
+                    pass
+                    
+            models_list.append({
+                "name": f[:-3],  # Nom sans .pt
+                "displayName": display_name,
+                "version": version,
+                "parameters": parameters,
+                "filename": f,
+                "size_bytes": stat_info.st_size,
+                "modified_time": stat_info.st_mtime
+            })
+            
+    # Tri par date de modification décroissante (le plus récent en premier)
+    models_list.sort(key=lambda x: x["modified_time"], reverse=True)
+    return models_list
+
 active_websockets = []
 command_queue = asyncio.Queue()
 
+# --- VARIABLES GLOBALES DU MODE ENTRAÎNEMENT ---
+global_robot = None
+training_mode_active = False
+is_recording = False
+training_frames = []
+training_sensors = []
+training_actions = []
+training_timestamps = []
+current_left_speed = 0.0
+current_right_speed = 0.0
+current_head_angle = 30.0
+last_drive_command_time = 0.0
+current_session_name = ""
+recording_task = None
+
+# --- VARIABLES GLOBALES DU MODE NN ---
+nn_active = False
+nn_task = None
+nn_model_name = ""
+nn_model = None
+sensors_mean = None
+sensors_std = None
+
+# --- VARIABLES GLOBALES DU MODE HYBRIDE ---
+hybrid_active = False
+hybrid_task = None
+hybrid_shared_state = None
+
+def load_model_and_stats_sync(model_name):
+    global nn_model, sensors_mean, sensors_std
+    try:
+        # Strip .pt if present
+        model_key = model_name
+        if model_key.endswith(".pt"):
+            model_key = model_key[:-3]
+            
+        if model_key.startswith("cozmo_nn_"):
+            suffix = model_key[len("cozmo_nn_"):]
+        else:
+            suffix = model_key
+            
+        model_path = os.path.join("models", f"{model_key}.pt")
+        norm_stats_path = os.path.join("models", f"norm_stats_{suffix}.json")
+        
+        if not os.path.exists(model_path):
+            print(f"Model file not found: {model_path}")
+            return False
+            
+        if not os.path.exists(norm_stats_path):
+            print(f"Norm stats file not found: {norm_stats_path}")
+            return False
+            
+        # Load stats
+        with open(norm_stats_path, 'r') as f:
+            stats = json.load(f)
+        sensors_mean = np.array(stats['mean'], dtype=np.float32)
+        sensors_std = np.array(stats['std'], dtype=np.float32)
+        
+        # Instantiate model
+        nn_model = CozmoNN()
+        state_dict = torch.load(model_path, map_location=torch.device('cpu'), weights_only=True)
+        nn_model.load_state_dict(state_dict)
+        nn_model.eval()
+        
+        return True
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        return False
+
+async def start_nn_mode(robot, model_name):
+    global nn_active, nn_task, nn_model_name
+    if not TORCH_AVAILABLE:
+        await broadcast_data({"type": "terminal_log", "message": "❌ Erreur : PyTorch n'est pas disponible.", "source": "system"})
+        return
+        
+    if nn_active:
+        return
+        
+    # Stop other conflicting modes
+    global training_mode_active
+    if training_mode_active:
+        training_mode_active = False
+        await stop_recording_and_save(robot)
+        
+    nn_model_name = model_name
+    nn_active = True
+    
+    loop = asyncio.get_event_loop()
+    try:
+        await broadcast_data({"type": "terminal_log", "message": f"🧠 Chargement du modèle {model_name}...", "source": "system"})
+        success = await loop.run_in_executor(None, load_model_and_stats_sync, model_name)
+        if not success:
+            nn_active = False
+            await broadcast_data({"type": "terminal_log", "message": f"❌ Échec du chargement du modèle {model_name}", "source": "system"})
+            return
+            
+        nn_task = asyncio.create_task(nn_inference_loop(robot))
+        await broadcast_data({"type": "terminal_log", "message": f"▶️ Mode NN démarré avec {model_name}", "source": "system"})
+        # Also broadcast initial status
+        await broadcast_data({
+            "type": "nn_status",
+            "active": True,
+            "model_name": nn_model_name,
+            "fps": 20.0,
+            "inference_ms": 0.0,
+            "left_speed": 0.0,
+            "right_speed": 0.0,
+            "head_angle": robot.head_angle.degrees if robot.head_angle else 0.0,
+            "cliff_events": 0
+        })
+    except Exception as e:
+        nn_active = False
+        await broadcast_data({"type": "terminal_log", "message": f"❌ Erreur de chargement : {str(e)}", "source": "system"})
+
+async def stop_nn_mode(robot):
+    global nn_active, nn_task
+    if not nn_active:
+        return
+    nn_active = False
+    if robot:
+        try:
+            await robot.stop_all_motors()
+        except Exception:
+            pass
+            
+    if nn_task:
+        try:
+            await nn_task
+        except Exception:
+            pass
+        nn_task = None
+        
+    await broadcast_data({"type": "terminal_log", "message": "⏹ Mode NN arrêté.", "source": "system"})
+    await broadcast_data({
+        "type": "nn_status",
+        "active": False,
+        "model_name": "",
+        "fps": 0.0,
+        "inference_ms": 0.0,
+        "left_speed": 0.0,
+        "right_speed": 0.0,
+        "head_angle": 0.0,
+        "cliff_events": 0
+    })
+
+# =====================================================================
+# --- FONCTIONS DU MODE HYBRIDE (Phase 4) ---
+# =====================================================================
+async def start_hybrid_mode(robot, commande_utilisateur, model_name=None):
+    """Démarre le mode exploration hybride NN + Gemini."""
+    global hybrid_active, hybrid_task, hybrid_shared_state
+    global training_mode_active, nn_active
+
+    if hybrid_active:
+        await broadcast_data({"type": "terminal_log", "message": "⚠️ Mode hybride déjà actif.", "source": "system"})
+        return
+
+    # Arrêter les modes conflictuels
+    if training_mode_active:
+        training_mode_active = False
+        await stop_recording_and_save(robot)
+    if nn_active:
+        await stop_nn_mode(robot)
+
+    hybrid_active = True
+    # Créer le shared_state immédiatement pour que le kill switch fonctionne
+    hybrid_shared_state = {
+        "cap_cible": 0.0,
+        "description_scene": "",
+        "strategie": "",
+        "objectif_atteint": False,
+        "confiance": 0.0,
+        "kill_switch": False,
+        "nn_active": True,
+        "gemini_active": True,
+    }
+    await broadcast_data({"type": "terminal_log", "message": "🚀 Démarrage du mode hybride...", "source": "system"})
+
+    async def _run_hybrid():
+        global hybrid_active, hybrid_shared_state
+        try:
+            await lancer_exploration_hybride(
+                robot, commande_utilisateur, broadcast_data,
+                model_name=model_name, shared_state=hybrid_shared_state
+            )
+        except Exception as e:
+            await broadcast_data({"type": "terminal_log", "message": "❌ Erreur mode hybride : " + str(e), "source": "system"})
+        finally:
+            hybrid_active = False
+            hybrid_shared_state = None
+            await broadcast_data({"type": "hybrid_stopped"})
+            await broadcast_data({"type": "terminal_log", "message": "⏹ Mode hybride arrêté.", "source": "system"})
+
+    hybrid_task = asyncio.create_task(_run_hybrid())
+
+
+async def stop_hybrid_mode():
+    """Arrête le mode hybride en activant le kill switch."""
+    global hybrid_active, hybrid_task, hybrid_shared_state
+
+    if not hybrid_active:
+        return
+
+    # Activer le kill switch pour arrêter les deux boucles
+    if hybrid_shared_state is not None:
+        hybrid_shared_state["kill_switch"] = True
+
+    # Attendre la fin propre
+    if hybrid_task is not None:
+        try:
+            await asyncio.wait_for(hybrid_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            hybrid_task.cancel()
+            try:
+                await hybrid_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        except Exception:
+            pass
+        hybrid_task = None
+
+    hybrid_active = False
+    hybrid_shared_state = None
+
+    if global_robot:
+        try:
+            await global_robot.stop_all_motors()
+        except Exception:
+            pass
+
+    await broadcast_data({"type": "hybrid_stopped"})
+
+
+async def nn_inference_loop(robot):
+    global nn_active, nn_model, sensors_mean, sensors_std, nn_model_name
+    loop = asyncio.get_event_loop()
+    
+    fps_ema = 20.0
+    inf_ms_ema = 0.0
+    last_tick_time = 0.0
+    tick_count = 0
+    cliff_events = 0
+    watchdog_counter = 0
+
+    while nn_active:
+        start_time = loop.time()
+        
+        # Calculate FPS
+        t_now = loop.time()
+        if last_tick_time > 0:
+            dt = t_now - last_tick_time
+            current_fps = 1.0 / dt if dt > 0 else 20.0
+            fps_ema = 0.9 * fps_ema + 0.1 * current_fps
+        last_tick_time = t_now
+        
+        # Sécurité anti-chute (cliff override)
+        if robot.is_cliff_detected:
+            cliff_events += 1
+            await robot.stop_all_motors()
+            await robot.drive_straight(cozmo.util.distance_mm(-50), cozmo.util.speed_mmps(50)).wait_for_completed()
+            await asyncio.sleep(0.5)
+            continue
+            
+        # 1. Capture image (80x60 grayscale, normalisée [0,1])
+        try:
+            latest = robot.world.latest_image
+            if latest is not None and latest.raw_image is not None:
+                def process_image(img):
+                    gray_img = img.convert('L').resize((80, 60))
+                    return np.array(gray_img, dtype=np.float32) / 255.0
+                img_arr = await loop.run_in_executor(None, process_image, latest.raw_image)
+            else:
+                img_arr = np.zeros((60, 80), dtype=np.float32)
+        except Exception:
+            img_arr = np.zeros((60, 80), dtype=np.float32)
+            
+        # 2. Capture sensory vector
+        sensors = get_sensor_vector(robot)
+        
+        # 3. Normaliser les capteurs
+        try:
+            sensors_normalized = (np.array(sensors, dtype=np.float32) - sensors_mean[0]) / sensors_std[0]
+        except Exception as e:
+            print(f"Normalization error: {e}")
+            sensors_normalized = np.zeros((12,), dtype=np.float32)
+            
+        # 4. Inférence (forward pass)
+        t_inf_start = time.time()
+        try:
+            img_tensor = torch.from_numpy(img_arr).unsqueeze(0).unsqueeze(0)      # (1, 1, 60, 80)
+            sensor_tensor = torch.from_numpy(sensors_normalized).unsqueeze(0)    # (1, 12)
+            
+            with torch.no_grad():
+                outputs = nn_model(img_tensor, sensor_tensor)
+                left_speed = float(outputs[0, 0].item())
+                right_speed = float(outputs[0, 1].item())
+                head_angle = float(outputs[0, 2].item())
+        except Exception as e:
+            print(f"Inference error: {e}")
+            left_speed = 0.0
+            right_speed = 0.0
+            head_angle = robot.head_angle.degrees if robot.head_angle else 0.0
+            
+        t_inf_end = time.time()
+        inference_ms = (t_inf_end - t_inf_start) * 1000.0
+        inf_ms_ema = 0.9 * inf_ms_ema + 0.1 * inference_ms
+        
+        # Watchdog
+        if inference_ms > 100.0:
+            watchdog_counter += 1
+            print(f"⚠️ Warning: Inference took {inference_ms:.1f}ms (> 100ms)")
+            await broadcast_data({"type": "terminal_log", "message": f"⚠️ Inférence lente : {inference_ms:.1f}ms ({watchdog_counter}/5)", "source": "system"})
+            if watchdog_counter >= 5:
+                await broadcast_data({"type": "terminal_log", "message": "🚨 Arrêt d'urgence : 5 inférences lentes consécutives !", "source": "system"})
+                nn_active = False
+                await robot.stop_all_motors()
+                await broadcast_data({
+                    "type": "nn_status",
+                    "active": False,
+                    "model_name": "",
+                    "fps": 0.0,
+                    "inference_ms": 0.0,
+                    "left_speed": 0.0,
+                    "right_speed": 0.0,
+                    "head_angle": 0.0,
+                    "cliff_events": cliff_events
+                })
+                break
+        else:
+            watchdog_counter = 0
+            
+        # 5. Appliquer les commandes aux roues
+        try:
+            left_speed = max(-150.0, min(150.0, left_speed))
+            right_speed = max(-150.0, min(150.0, right_speed))
+            await robot.drive_wheels(left_speed, right_speed)
+        except Exception as e:
+            print(f"Error driving wheels: {e}")
+            
+        # 6. Ajuster l'angle de la tête
+        try:
+            current_head = robot.head_angle.degrees if robot.head_angle else 0.0
+            if abs(head_angle - current_head) > 2.0:
+                robot.set_head_angle(cozmo.util.degrees(head_angle), in_parallel=True)
+        except Exception as e:
+            print(f"Error setting head angle: {e}")
+            
+        # 7. Broadcast vers le dashboard les décisions du NN (~4Hz)
+        tick_count += 1
+        if tick_count % 5 == 0:
+            await broadcast_data({
+                "type": "nn_status",
+                "active": True,
+                "model_name": nn_model_name,
+                "fps": round(fps_ema, 1),
+                "inference_ms": round(inf_ms_ema, 1),
+                "left_speed": round(left_speed, 1),
+                "right_speed": round(right_speed, 1),
+                "head_angle": round(head_angle, 1),
+                "cliff_events": cliff_events
+            })
+            
+        # Sleep pour maintenir 20Hz
+        elapsed = loop.time() - start_time
+        sleep_time = max(0.001, 0.05 - elapsed)
+        await asyncio.sleep(sleep_time)
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    global training_mode_active, current_left_speed, current_right_speed, last_drive_command_time, current_head_angle, nn_active
     await websocket.accept()
     active_websockets.append(websocket)
     try:
         while True:
             data = await websocket.receive_json()
-            if data.get("type") == "command":
+            msg_type = data.get("type")
+            if msg_type == "command":
                 await command_queue.put(data.get("command"))
+            elif msg_type == "training_mode":
+                training_mode_active = data.get("active", False)
+                if training_mode_active and nn_active:
+                    await stop_nn_mode(global_robot)
+                if not training_mode_active and is_recording:
+                    await stop_recording_and_save(global_robot)
+            elif msg_type == "training_start":
+                await start_recording(global_robot)
+            elif msg_type == "training_stop":
+                await stop_recording_and_save(global_robot)
+            elif msg_type == "training_drive":
+                current_left_speed = float(data.get("left", 0.0))
+                current_right_speed = float(data.get("right", 0.0))
+                last_drive_command_time = asyncio.get_event_loop().time()
+                if global_robot:
+                    try:
+                        # Sécurité anti-chute en mode entraînement
+                        if global_robot.is_cliff_detected:
+                            is_backward = (current_left_speed <= 0 and current_right_speed <= 0)
+                            is_turn_in_place = (current_left_speed * current_right_speed < 0)
+                            if not (is_backward or is_turn_in_place):
+                                current_left_speed = 0.0
+                                current_right_speed = 0.0
+                                await global_robot.stop_all_motors()
+                        await global_robot.drive_wheels(current_left_speed, current_right_speed)
+                    except Exception:
+                        pass
+            elif msg_type == "training_head":
+                angle = float(data.get("angle", 0.0))
+                current_head_angle = angle
+                if global_robot:
+                    try:
+                        global_robot.set_head_angle(cozmo.util.degrees(angle), in_parallel=True)
+                    except Exception:
+                        pass
+            elif msg_type == "nn_start":
+                model_name = data.get("model")
+                if global_robot:
+                    await start_nn_mode(global_robot, model_name)
+            elif msg_type == "nn_stop":
+                if global_robot:
+                    await stop_nn_mode(global_robot)
+            elif msg_type == "hybrid_start":
+                objective = data.get("objective", "")
+                model_name = data.get("model", "") or None
+                if global_robot and objective:
+                    await start_hybrid_mode(global_robot, objective, model_name)
+            elif msg_type == "hybrid_stop":
+                await stop_hybrid_mode()
     except WebSocketDisconnect:
         active_websockets.remove(websocket)
+        if not active_websockets:
+            if nn_active:
+                await stop_nn_mode(global_robot)
+            if hybrid_active:
+                await stop_hybrid_mode()
 
 async def broadcast_data(data: dict):
     for ws in list(active_websockets):
@@ -65,6 +545,226 @@ async def broadcast_data(data: dict):
             await ws.send_json(data)
         except Exception:
             pass
+
+# =====================================================================
+# --- FONCTIONS DU MODE ENTRAÎNEMENT ---
+# =====================================================================
+def get_sensor_vector(robot):
+    sensor_vector = [0.0] * 12
+    if robot is None:
+        return sensor_vector
+        
+    # 1. robot.pose.position.x
+    try:
+        sensor_vector[0] = float(robot.pose.position.x)
+    except Exception:
+        pass
+    # 2. robot.pose.position.y
+    try:
+        sensor_vector[1] = float(robot.pose.position.y)
+    except Exception:
+        pass
+    # 3. robot.pose.rotation.angle_z.degrees
+    try:
+        sensor_vector[2] = float(robot.pose.rotation.angle_z.degrees)
+    except Exception:
+        pass
+    # 4. robot.pose_pitch.degrees
+    try:
+        sensor_vector[3] = float(robot.pose_pitch.degrees)
+    except Exception:
+        pass
+    # 5. robot.left_wheel_speed.speed_mmps
+    try:
+        if robot.left_wheel_speed is not None:
+            sensor_vector[4] = float(robot.left_wheel_speed.speed_mmps)
+    except Exception:
+        pass
+    # 6. robot.right_wheel_speed.speed_mmps
+    try:
+        if robot.right_wheel_speed is not None:
+            sensor_vector[5] = float(robot.right_wheel_speed.speed_mmps)
+    except Exception:
+        pass
+    # 7. 1.0 if robot.is_cliff_detected else 0.0
+    try:
+        sensor_vector[6] = 1.0 if robot.is_cliff_detected else 0.0
+    except Exception:
+        pass
+    # 8. robot.lift_height.distance_mm
+    try:
+        if robot.lift_height is not None:
+            sensor_vector[7] = float(robot.lift_height.distance_mm)
+    except Exception:
+        pass
+    # 9. robot.head_angle.degrees
+    try:
+        if robot.head_angle is not None:
+            sensor_vector[8] = float(robot.head_angle.degrees)
+    except Exception:
+        pass
+    # 10. robot.battery_voltage
+    try:
+        if robot.battery_voltage is not None:
+            sensor_vector[9] = float(robot.battery_voltage)
+    except Exception:
+        pass
+    # 11. robot.pose.rotation.q0
+    try:
+        if robot.pose is not None and robot.pose.rotation is not None:
+            sensor_vector[10] = float(robot.pose.rotation.q0)
+    except Exception:
+        pass
+    # 12. 1.0 if robot.is_moving else 0.0
+    try:
+        sensor_vector[11] = 1.0 if robot.is_moving else 0.0
+    except Exception:
+        pass
+    return sensor_vector
+
+async def training_recording_loop(robot):
+    global is_recording, training_frames, training_sensors, training_actions, training_timestamps
+    loop = asyncio.get_event_loop()
+    
+    while is_recording:
+        start_time = loop.time()
+        
+        # 1. Capture image
+        try:
+            latest = robot.world.latest_image
+            if latest is not None and latest.raw_image is not None:
+                def process_image(img):
+                    gray_img = img.convert('L').resize((80, 60))
+                    return np.array(gray_img, dtype=np.uint8)
+                img_arr = await loop.run_in_executor(None, process_image, latest.raw_image)
+            else:
+                img_arr = np.zeros((60, 80), dtype=np.uint8)
+        except Exception:
+            img_arr = np.zeros((60, 80), dtype=np.uint8)
+            
+        # 2. Capture sensory vector
+        sensors = get_sensor_vector(robot)
+        
+        # 3. Capture actions
+        actions = [
+            float(current_left_speed),
+            float(current_right_speed),
+            float(current_head_angle)
+        ]
+        
+        # 4. Save to list
+        training_frames.append(img_arr)
+        training_sensors.append(sensors)
+        training_actions.append(actions)
+        training_timestamps.append(time.time())
+        
+        # Sleep to maintain 20Hz (50ms interval)
+        elapsed = loop.time() - start_time
+        sleep_time = max(0.001, 0.05 - elapsed)
+        await asyncio.sleep(sleep_time)
+
+async def start_recording(robot):
+    global is_recording, training_frames, training_sensors, training_actions, training_timestamps
+    global current_session_name, recording_task
+    if is_recording or robot is None:
+        return
+    
+    training_frames = []
+    training_sensors = []
+    training_actions = []
+    training_timestamps = []
+    
+    import datetime
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    current_session_name = f"session_{now_str}"
+    is_recording = True
+    
+    recording_task = asyncio.create_task(training_recording_loop(robot))
+    print(f"⏺ Début de l'enregistrement de la session {current_session_name}")
+
+async def stop_recording_and_save(robot):
+    global is_recording, recording_task
+    if not is_recording:
+        return
+    
+    is_recording = False
+    if recording_task:
+        try:
+            await recording_task
+        except Exception:
+            pass
+        recording_task = None
+    
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, stop_and_save_sync)
+
+def stop_and_save_sync():
+    global training_frames, training_sensors, training_actions, training_timestamps, current_session_name
+    if not training_timestamps:
+        print("⚠️ Aucun enregistrement à sauvegarder.")
+        return
+    
+    os.makedirs("training_data", exist_ok=True)
+    filepath = os.path.join("training_data", f"{current_session_name}.npz")
+    
+    frames_arr = np.array(training_frames, dtype=np.uint8)
+    sensors_arr = np.array(training_sensors, dtype=np.float32)
+    actions_arr = np.array(training_actions, dtype=np.float32)
+    timestamps_arr = np.array(training_timestamps, dtype=np.float64)
+    
+    np.savez_compressed(
+        filepath,
+        frames=frames_arr,
+        sensors=sensors_arr,
+        actions=actions_arr,
+        timestamps=timestamps_arr
+    )
+    
+    size_mb = os.path.getsize(filepath) / (1024.0 * 1024.0)
+    print(f"⏹ Session {current_session_name} sauvegardée avec succès: {filepath} ({size_mb:.2f} MB, {len(timestamps_arr)} frames)")
+    
+    training_frames = []
+    training_sensors = []
+    training_actions = []
+    training_timestamps = []
+
+async def safety_timeout_loop():
+    global current_left_speed, current_right_speed
+    while True:
+        await asyncio.sleep(0.05)
+        if training_mode_active:
+            now = asyncio.get_event_loop().time()
+            if now - last_drive_command_time > 0.2:
+                if current_left_speed != 0.0 or current_right_speed != 0.0:
+                    current_left_speed = 0.0
+                    current_right_speed = 0.0
+                    try:
+                        if global_robot:
+                            global_robot.drive_wheels(0.0, 0.0)
+                    except Exception:
+                        pass
+
+async def stream_training_status():
+    while True:
+        await asyncio.sleep(0.5)
+        if training_mode_active:
+            if is_recording and len(training_timestamps) > 0:
+                duration = training_timestamps[-1] - training_timestamps[0]
+            else:
+                duration = 0.0
+            
+            n_samples = len(training_timestamps)
+            raw_bytes = n_samples * (60 * 80 * 1 + 12 * 4 + 3 * 4 + 8)
+            size_mb = round(raw_bytes / (1024.0 * 1024.0), 2)
+            
+            await broadcast_data({
+                "type": "training_status",
+                "recording": is_recording,
+                "session_name": current_session_name,
+                "frame_count": n_samples,
+                "duration_s": round(duration, 2),
+                "file_size_mb": size_mb
+            })
 
 async def start_server():
     config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
@@ -86,13 +786,31 @@ async def stream_telemetry(robot):
         await asyncio.sleep(0.1)
         try:
             if hasattr(robot, 'pose'):
+                left_speed = 0.0
+                right_speed = 0.0
+                try:
+                    if robot.left_wheel_speed is not None:
+                        left_speed = robot.left_wheel_speed.speed_mmps
+                except Exception:
+                    pass
+                try:
+                    if robot.right_wheel_speed is not None:
+                        right_speed = robot.right_wheel_speed.speed_mmps
+                except Exception:
+                    pass
+                
                 await broadcast_data({
                     "type": "state_update",
                     "odometry": {
                         "x": robot.pose.position.x,
                         "y": robot.pose.position.y,
                         "cap": robot.pose.rotation.angle_z.degrees
-                    }
+                    },
+                    "wheels": {
+                        "left": left_speed,
+                        "right": right_speed
+                    },
+                    "cliff_detected": robot.is_cliff_detected
                 })
         except Exception:
             pass
@@ -324,9 +1042,15 @@ def generer_image_meteo(ville, temp, condition):
 # --- LE CORPS (Boucle principale) ---
 # =====================================================================
 async def cozmo_program(robot: cozmo.robot.Robot):
+    global global_robot
+    global_robot = robot
     robot.camera.image_stream_enabled = True
     await asyncio.sleep(1.0)
     await robot.set_head_angle(cozmo.util.degrees(30)).wait_for_completed()
+    try:
+        await robot.set_lift_height(1.0).wait_for_completed()
+    except Exception as e:
+        print(f"Error setting initial lift height: {e}")
     print("⚙️ Connexion établie.")
     loop = asyncio.get_event_loop()
 
@@ -335,6 +1059,8 @@ async def cozmo_program(robot: cozmo.robot.Robot):
     asyncio.create_task(stream_video(robot))
     asyncio.create_task(stream_telemetry(robot))
     asyncio.create_task(terminal_input_task(loop))
+    asyncio.create_task(safety_timeout_loop())
+    asyncio.create_task(stream_training_status())
     
     await broadcast_data({"type": "terminal_log", "message": "Système prêt. Entrez une commande.", "source": "system"})
 
@@ -368,11 +1094,16 @@ async def cozmo_program(robot: cozmo.robot.Robot):
         if mot_detecte:
             commande_complete = question.strip()
 
-            await robot.say_text("Mode exploration activé.", in_parallel=True).wait_for_completed()
-            await broadcast_data({"type": "terminal_log", "message": "Mode exploration activé.", "source": "system"})
-
-            # Lancement de l'exploration (en lui passant broadcast_data pour logger)
-            await lancer_exploration(robot, commande_complete, broadcast_data)
+            # Phase 4 : routage automatique vers le mode hybride si un modèle NN est disponible
+            latest_model = find_latest_model()
+            if latest_model and TORCH_AVAILABLE:
+                await robot.say_text("Mode exploration hybride activé.", in_parallel=True).wait_for_completed()
+                await broadcast_data({"type": "terminal_log", "message": "🚀 Mode hybride NN + Gemini activé.", "source": "system"})
+                await start_hybrid_mode(robot, commande_complete)
+            else:
+                await robot.say_text("Mode exploration activé.", in_parallel=True).wait_for_completed()
+                await broadcast_data({"type": "terminal_log", "message": "Mode exploration classique activé (aucun modèle NN disponible).", "source": "system"})
+                await lancer_exploration(robot, commande_complete, broadcast_data)
             continue
 
         # --- Capture image caméra ---

@@ -28,7 +28,7 @@
             </div>
         </header>
 
-        <main class="grid-layout">
+        <main class="grid-layout" id="main-dashboard">
             <!-- Colonne Gauche : Vidéo et Odométrie -->
             <section class="left-panel">
                 <div class="glass-panel video-container">
@@ -99,13 +99,373 @@
                         </form>
                     </div>
                     <div class="quick-actions">
-                        <button id="btn-map3d" class="btn-action map-btn">🗺️ Carte 3D</button>
                         <button id="btn-stop" class="btn-action danger">🛑 Stop Urgence</button>
                         <button id="btn-left" class="btn-action">⬅️ Gauche 90°</button>
                         <button id="btn-forward" class="btn-action">⬆️ Avancer 10cm</button>
                         <button id="btn-right" class="btn-action">➡️ Droite 90°</button>
+                        <button id="btn-map3d" class="btn-action map-btn">🗺️ Carte 3D</button>
+                        <button id="btn-training" class="btn-action training-btn">🎮 Mode Entraînement</button>
+                        <button id="btn-nn-mode" class="btn-action nn-btn">🧠 Mode NN</button>
+                        <button id="btn-hybrid" class="btn-action hybrid-btn">🚀 Exploration Hybride</button>
                     </div>
                 </div>
+            </section>
+        </main>
+
+        <!-- Nouveau Panneau d'Entraînement (Masqué par défaut) -->
+        <main class="training-layout hidden" id="training-panel">
+            <!-- Colonne Gauche : Caméra + Boutons Enregistrement -->
+            <section class="left-panel">
+                <div class="glass-panel training-video-container">
+                    <div class="panel-header">
+                        <h2>Pilote Manuel &amp; Enregistrement</h2>
+                        <div class="header-badges">
+                            <span class="badge danger hidden" id="training-rec-badge">
+                                <span class="rec-dot"></span> REC
+                            </span>
+                            <span class="badge" id="training-status-badge">Prêt</span>
+                        </div>
+                    </div>
+                    <div class="video-wrapper" id="training-video-wrapper">
+                        <!-- L'image #video-feed sera déplacée ici en JS -->
+                    </div>
+                    <div class="training-controls">
+                        <button id="btn-start-record" class="btn-primary">⏺ Démarrer Enregistrement</button>
+                        <button id="btn-stop-record" class="btn-action danger" disabled>⏹ Arrêter</button>
+                        <button id="btn-exit-training" class="btn-action">🔙 Retour Dashboard</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Colonne Droite : Visualisation Clavier + Télémétrie Entraînement -->
+            <section class="right-panel">
+                <div class="glass-panel keyboard-visualizer-container">
+                    <div class="panel-header">
+                        <h2>Visualisation des Contrôles</h2>
+                    </div>
+                    <div class="keyboard-visualizer">
+                        <div class="keyboard-row">
+                            <div class="keycap empty"></div>
+                            <div class="keycap" id="key-KeyW">Z</div>
+                            <div class="keycap empty"></div>
+                        </div>
+                        <div class="keyboard-row">
+                            <div class="keycap" id="key-KeyA">Q</div>
+                            <div class="keycap" id="key-KeyS">S</div>
+                            <div class="keycap" id="key-KeyD">D</div>
+                        </div>
+                        <div class="keyboard-row arrows-row">
+                            <div class="keycap" id="key-ArrowUp">▲</div>
+                            <div class="keycap" id="key-ArrowDown">▼</div>
+                        </div>
+                        <div class="keyboard-legend">
+                            ZQSD : Déplacement | Flèches Haut/Bas : Angle Tête (Clampe: -25° à 44.5°)
+                        </div>
+                    </div>
+                </div>
+
+                <div class="glass-panel training-telemetry-container">
+                    <div class="panel-header">
+                        <h2>Télémétrie en Direct</h2>
+                    </div>
+                    <div class="stats-grid">
+                        <div class="stat-box">
+                            <span class="stat-label">Pos X / Y</span>
+                            <span class="stat-value" id="train-pos-xy">0.0 / 0.0</span>
+                            <span class="stat-unit">cm</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Cap</span>
+                            <span class="stat-value" id="train-pos-cap">0.0</span>
+                            <span class="stat-unit">°</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Roue L / R</span>
+                            <span class="stat-value" id="train-wheels-speed">0 / 0</span>
+                            <span class="stat-unit">mm/s</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="glass-panel training-stats-container">
+                    <div class="panel-header">
+                        <h2>Statistiques de Session</h2>
+                    </div>
+                    <div class="stats-grid">
+                        <div class="stat-box">
+                            <span class="stat-label">Frames</span>
+                            <span class="stat-value" id="train-frames">0</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Durée</span>
+                            <span class="stat-value" id="train-duration">0.00</span>
+                            <span class="stat-unit">s</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Taille</span>
+                            <span class="stat-value" id="train-size">0.00</span>
+                            <span class="stat-unit">MB</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Nouveau Panneau NN Autonome (Masqué par défaut) -->
+        <main class="nn-layout hidden" id="nn-panel">
+            <!-- Colonne Gauche : Caméra + Sélection modèle + Boutons -->
+            <section class="left-panel">
+                <div class="glass-panel nn-video-container">
+                    <div class="panel-header">
+                        <h2>Pilote Autonome NN</h2>
+                        <div class="header-badges">
+                            <span class="badge danger hidden" id="nn-active-badge">
+                                <span class="rec-dot"></span> AUTONOME
+                            </span>
+                            <span class="badge" id="nn-status-badge">Arrêté</span>
+                        </div>
+                    </div>
+                    <div class="video-wrapper" id="nn-video-wrapper">
+                        <!-- L'image #video-feed sera déplacée ici en JS -->
+                    </div>
+                    <div class="nn-controls">
+                        <div class="control-row">
+                            <label for="nn-model-select">Modèle :</label>
+                            <select id="nn-model-select" class="nn-select">
+                                <option value="">Chargement des modèles...</option>
+                            </select>
+                        </div>
+                        <div class="control-buttons">
+                            <button id="btn-nn-start" class="btn-primary">▶ Démarrer</button>
+                            <button id="btn-nn-stop" class="btn-action danger" disabled>⏹ Arrêter</button>
+                            <button id="btn-exit-nn" class="btn-action">🔙 Retour</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Colonne Droite : Métriques & Visualisation Décisions -->
+            <section class="right-panel">
+                <!-- Métriques de Performance -->
+                <div class="glass-panel nn-metrics-container">
+                    <div class="panel-header">
+                        <h2>Performances Réseau</h2>
+                    </div>
+                    <div class="stats-grid">
+                        <div class="stat-box">
+                            <span class="stat-label">Inférence</span>
+                            <span class="stat-value" id="nn-inference-ms">0.0</span>
+                            <span class="stat-unit">ms</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Fréquence</span>
+                            <span class="stat-value" id="nn-fps">0.0</span>
+                            <span class="stat-unit">FPS</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Falaises</span>
+                            <span class="stat-value" id="nn-cliff-events">0</span>
+                            <span class="stat-unit">alertes</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Visualisation en Temps Réel -->
+                <div class="glass-panel nn-visualizer-container">
+                    <div class="panel-header">
+                        <h2>Décisions Moteur (Visualisation)</h2>
+                    </div>
+                    <div class="nn-visualizer-body">
+                        <!-- Les deux barres de vitesse -->
+                        <div class="wheel-speeds-visualizer">
+                            <div class="wheel-bar-container left-wheel">
+                                <div class="wheel-bar-track">
+                                    <div class="wheel-bar-fill" id="nn-left-bar"></div>
+                                </div>
+                                <span class="wheel-label">Roue Gauche</span>
+                                <span class="wheel-value" id="nn-left-value">0 mm/s</span>
+                            </div>
+                            
+                            <div class="wheel-bar-container right-wheel">
+                                <div class="wheel-bar-track">
+                                    <div class="wheel-bar-fill" id="nn-right-bar"></div>
+                                </div>
+                                <span class="wheel-label">Roue Droite</span>
+                                <span class="wheel-value" id="nn-right-value">0 mm/s</span>
+                            </div>
+                        </div>
+                        
+                        <!-- Visualisation de la tête -->
+                        <div class="head-angle-visualizer">
+                            <span class="head-label">Tête :</span>
+                            <div class="head-slider-container">
+                                <div class="head-slider-track">
+                                    <div class="head-slider-fill" id="nn-head-fill"></div>
+                                    <div class="head-slider-thumb" id="nn-head-thumb"></div>
+                                </div>
+                            </div>
+                            <span class="head-value" id="nn-head-value">0.0°</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Gros Bouton d'Arrêt d'Urgence (Kill Switch) -->
+                <button id="btn-nn-kill" class="btn-kill-switch">🚨 ARRET D'URGENCE (KILL SWITCH)</button>
+            </section>
+        </main>
+
+        <!-- Panneau Exploration Hybride NN + Gemini (Masqué par défaut) -->
+        <main class="hybrid-layout hidden" id="hybrid-panel">
+            <!-- Colonne Gauche : Caméra + Objectif + Contrôles -->
+            <section class="left-panel">
+                <div class="glass-panel hybrid-video-container">
+                    <div class="panel-header">
+                        <h2>Exploration Hybride NN + Gemini</h2>
+                        <div class="header-badges">
+                            <span class="hybrid-indicator nn-indicator hidden" id="hybrid-nn-badge">
+                                <span class="indicator-dot"></span> NN
+                            </span>
+                            <span class="hybrid-indicator gemini-indicator hidden" id="hybrid-gemini-badge">
+                                <span class="indicator-dot"></span> Gemini
+                            </span>
+                        </div>
+                    </div>
+                    <div class="video-wrapper" id="hybrid-video-wrapper">
+                        <!-- L'image #video-feed sera déplacée ici en JS -->
+                    </div>
+                    <div class="hybrid-controls">
+                        <div class="control-row">
+                            <label for="hybrid-model-select">Modèle :</label>
+                            <select id="hybrid-model-select" class="hybrid-select">
+                                <option value="">Chargement des modèles...</option>
+                            </select>
+                        </div>
+                        <div class="control-row">
+                            <label for="hybrid-objective">Objectif :</label>
+                            <input type="text" id="hybrid-objective" class="hybrid-objective-input" placeholder="Objectif : ex. 'va vers la porte'..." />
+                        </div>
+                        <div class="control-buttons">
+                            <button id="btn-hybrid-start" class="btn-primary">▶ Démarrer</button>
+                            <button id="btn-hybrid-stop" class="btn-action danger" disabled>⏹ Arrêter</button>
+                            <button id="btn-exit-hybrid" class="btn-action">🔙 Retour</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Colonne Droite : Boussole, Stratégie, Moteur, Kill Switch -->
+            <section class="right-panel">
+                <!-- Boussole & Navigation -->
+                <div class="glass-panel hybrid-compass-container">
+                    <div class="panel-header">
+                        <h2>Boussole &amp; Navigation</h2>
+                    </div>
+                    <div class="compass-container">
+                        <div class="compass-ring">
+                            <span class="compass-cardinal north">N</span>
+                            <span class="compass-cardinal east">E</span>
+                            <span class="compass-cardinal south">S</span>
+                            <span class="compass-cardinal west">O</span>
+                            <div class="compass-needle current" id="compass-needle-current"></div>
+                            <div class="compass-needle target" id="compass-needle-target"></div>
+                            <div class="compass-center-dot"></div>
+                        </div>
+                        <div class="compass-legend">
+                            <div class="compass-legend-item">
+                                <span class="compass-legend-dot current"></span> Cap actuel
+                            </div>
+                            <div class="compass-legend-item">
+                                <span class="compass-legend-dot target"></span> Cap cible
+                            </div>
+                        </div>
+                        <div class="compass-values">
+                            <div class="compass-value-box">
+                                <span class="compass-value-label">Actuel</span>
+                                <span class="compass-value-number current" id="compass-cap-actuel">0.0°</span>
+                            </div>
+                            <div class="compass-value-box">
+                                <span class="compass-value-label">Cible</span>
+                                <span class="compass-value-number target" id="compass-cap-cible">0.0°</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Stratégie Gemini -->
+                <div class="glass-panel hybrid-strategy-container">
+                    <div class="panel-header">
+                        <h2>Stratégie Gemini</h2>
+                    </div>
+                    <div class="strategy-body">
+                        <div class="strategy-field">
+                            <span class="strategy-field-label">Description scène</span>
+                            <div class="strategy-field-value" id="hybrid-scene-desc">En attente...</div>
+                        </div>
+                        <div class="strategy-field">
+                            <span class="strategy-field-label">Stratégie</span>
+                            <div class="strategy-field-value" id="hybrid-strategy">En attente...</div>
+                        </div>
+                        <div class="strategy-confidence">
+                            <span class="strategy-confidence-label">Confiance :</span>
+                            <span class="strategy-confidence-value" id="hybrid-confiance">-</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Décisions Moteur -->
+                <div class="glass-panel hybrid-visualizer-container">
+                    <div class="panel-header">
+                        <h2>Décisions Moteur</h2>
+                    </div>
+                    <div class="nn-visualizer-body">
+                        <div class="wheel-speeds-visualizer">
+                            <div class="wheel-bar-container left-wheel">
+                                <div class="wheel-bar-track">
+                                    <div class="wheel-bar-fill" id="hybrid-left-bar"></div>
+                                </div>
+                                <span class="wheel-label">Roue Gauche</span>
+                                <span class="wheel-value" id="hybrid-left-value">0 mm/s</span>
+                            </div>
+                            <div class="wheel-bar-container right-wheel">
+                                <div class="wheel-bar-track">
+                                    <div class="wheel-bar-fill" id="hybrid-right-bar"></div>
+                                </div>
+                                <span class="wheel-label">Roue Droite</span>
+                                <span class="wheel-value" id="hybrid-right-value">0 mm/s</span>
+                            </div>
+                        </div>
+                        <div class="head-angle-visualizer">
+                            <span class="head-label">Tête :</span>
+                            <div class="head-slider-container">
+                                <div class="head-slider-track">
+                                    <div class="head-slider-fill" id="hybrid-head-fill"></div>
+                                    <div class="head-slider-thumb" id="hybrid-head-thumb"></div>
+                                </div>
+                            </div>
+                            <span class="head-value" id="hybrid-head-value">0.0°</span>
+                        </div>
+                        <div class="stats-grid">
+                            <div class="stat-box">
+                                <span class="stat-label">Fréquence</span>
+                                <span class="stat-value" id="hybrid-fps">0.0</span>
+                                <span class="stat-unit">FPS</span>
+                            </div>
+                            <div class="stat-box">
+                                <span class="stat-label">Inférence</span>
+                                <span class="stat-value" id="hybrid-inference-ms">0.0</span>
+                                <span class="stat-unit">ms</span>
+                            </div>
+                            <div class="stat-box">
+                                <span class="stat-label">Falaises</span>
+                                <span class="stat-value" id="hybrid-cliff-events">0</span>
+                                <span class="stat-unit">alertes</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Kill Switch -->
+                <button id="btn-hybrid-kill" class="btn-kill-switch">🚨 ARRÊT D'URGENCE (KILL SWITCH)</button>
             </section>
         </main>
     </div>
@@ -113,7 +473,7 @@
     <!-- Overlay 3D SLAM Map -->
     <div id="map3d-overlay" class="hidden">
         <div class="map3d-header">
-            <h2>🌍 Cartographie SLAM 3D en direct</h2>
+            <h2>🌍 Carte 3D</h2>
             <button id="btn-close-map" class="btn-action danger">✖ Fermer</button>
         </div>
         
