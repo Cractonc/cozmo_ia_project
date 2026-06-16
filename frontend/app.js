@@ -647,17 +647,7 @@ async function loadModels() {
         models.forEach(m => {
             const opt = document.createElement('option');
             opt.value = m.name;
-            const sizeMB = (m.size_bytes / (1024 * 1024)).toFixed(1);
-            const dateStr = new Date(m.modified_time * 1000).toLocaleString();
-            
-            let displayName = m.displayName || m.name;
-            let optText = `${displayName} ${m.version ? m.version + " " : ""}(${sizeMB} MB`;
-            if (m.parameters) {
-                optText += `, ${m.parameters}`;
-            }
-            optText += `)`;
-            opt.textContent = optText;
-            
+            opt.textContent = m.displayName || m.name;
             nnModelSelect.appendChild(opt);
         });
     } catch (err) {
@@ -766,8 +756,7 @@ async function loadHybridModels() {
         models.forEach(m => {
             const opt = document.createElement('option');
             opt.value = m.name;
-            const sizeMB = (m.size_bytes / (1024 * 1024)).toFixed(1);
-            opt.textContent = (m.displayName || m.name) + ' (' + sizeMB + ' MB)';
+            opt.textContent = m.displayName || m.name;
             hybridModelSelect.appendChild(opt);
         });
     } catch (err) {

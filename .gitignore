@@ -1,8 +1,26 @@
 venv/
+env/
 .env
 __pycache__/
 *.pyc
+
+# Raw training data
 training_data/
-models/
+images/
 *.npz
+*.pkl
+
+# Logs / runs
+navigation_runs/
+
+# Technical debt
+models/archive/
+
+# Models
+models/*
+*.pt
 *.pth
+
+# Allowed release V2.4 files
+!models/cozmo_discrete_nn_2_4.pt
+!models/cozmo_discrete_nn_2_4.json

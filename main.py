@@ -33,6 +33,9 @@ from fastapi.middleware.cors import CORSMiddleware
 # Module de navigation Waypoint (Stop, Look, Think, Act + Fail-Safe)
 from navigation import lancer_exploration
 
+# Baseline reproductible pour le test Eiffel + boite, sans NN
+from baseline_navigation import lancer_benchmark_eiffel_baseline
+
 # Module de navigation hybride Phase 4 (NN + Gemini)
 from hybrid_navigation import lancer_exploration_hybride, find_latest_model
 
@@ -40,7 +43,7 @@ from hybrid_navigation import lancer_exploration_hybride, find_latest_model
 TORCH_AVAILABLE = False
 try:
     import torch
-    from model import CozmoNN
+    from model import CozmoNN, CozmoNNDiscrete
     TORCH_AVAILABLE = True
 except ImportError:
     pass
@@ -65,15 +68,23 @@ def get_models():
     if not os.path.exists(models_dir):
         return []
     
+    MODEL_MAPPING = {
+        "CozmoPilotDiscrete 2.4 (Prod)": "cozmo_discrete_nn_2_4.pt",
+        "CozmoPilotDiscrete 2.3 (4 Classes)": "cozmo_discrete_nn_2_3.pt",
+        "CozmoPilotDiscrete 2.2 (Symétrie)": "cozmo_discrete_nn_2_2.pt",
+        "CozmoPilotDiscrete 2.1 (Paranoïaque)": "cozmo_discrete_nn_2_1.pt",
+        "CozmoPilotDiscrete 2.0-experimentale": "cozmo_discrete_nn_2_0_exp.pt",
+        "CozmoPilot 1.0 (Continue)": "cozmo_nn_v1_0.pt"
+    }
+
     models_list = []
-    for f in os.listdir(models_dir):
-        if f.endswith(".pt"):
-            filepath = os.path.join(models_dir, f)
+    for display_name, filename in MODEL_MAPPING.items():
+        filepath = os.path.join(models_dir, filename)
+        if os.path.exists(filepath):
             stat_info = os.stat(filepath)
             
             # Read metadata if exists
-            metadata_path = os.path.join(models_dir, f.replace(".pt", ".json"))
-            display_name = f[:-3]
+            metadata_path = os.path.join(models_dir, filename.replace(".pt", ".json"))
             version = ""
             parameters = ""
             
@@ -81,72 +92,102 @@ def get_models():
                 try:
                     with open(metadata_path, 'r') as mf:
                         meta = json.load(mf)
-                        display_name = meta.get("displayName", display_name)
                         version = meta.get("version", "")
                         parameters = meta.get("parameters", "")
                 except Exception:
                     pass
                     
             models_list.append({
-                "name": f[:-3],  # Nom sans .pt
+                "name": filename[:-3],  # Nom sans .pt
                 "displayName": display_name,
                 "version": version,
                 "parameters": parameters,
-                "filename": f,
+                "filename": filename,
                 "size_bytes": stat_info.st_size,
                 "modified_time": stat_info.st_mtime
             })
             
-    # Tri par date de modification décroissante (le plus récent en premier)
-    models_list.sort(key=lambda x: x["modified_time"], reverse=True)
     return models_list
+
+
+@app.get("/api/navigation-runs")
+def get_navigation_runs():
+    runs_dir = "navigation_runs"
+    if not os.path.exists(runs_dir):
+        return []
+
+    runs = []
+    for name in os.listdir(runs_dir):
+        run_dir = os.path.join(runs_dir, name)
+        if not os.path.isdir(run_dir):
+            continue
+
+        summary_path = os.path.join(run_dir, "summary.json")
+        summary = {
+            "run_id": name,
+            "status": "unknown",
+            "branch": "",
+            "objective": "",
+            "duration_s": 0.0,
+            "frames": 0,
+        }
+        if os.path.exists(summary_path):
+            try:
+                with open(summary_path, "r", encoding="utf-8") as f:
+                    summary.update(json.load(f))
+            except Exception:
+                pass
+        summary["modified_time"] = os.path.getmtime(run_dir)
+        runs.append(summary)
+
+    runs.sort(key=lambda x: x["modified_time"], reverse=True)
+    return runs
 
 active_websockets = []
 command_queue = asyncio.Queue()
 
-# --- VARIABLES GLOBALES DU MODE ENTRAÎNEMENT ---
-global_robot = None
-training_mode_active = False
-is_recording = False
-training_frames = []
-training_sensors = []
-training_actions = []
-training_timestamps = []
-current_left_speed = 0.0
-current_right_speed = 0.0
-current_head_angle = 30.0
-last_drive_command_time = 0.0
-current_session_name = ""
-recording_task = None
+class CozmoStateManager:
+    def __init__(self):
+        self.robot = None
+        self.training_mode_active = False
+        self.is_recording = False
+        self.training_frames = []
+        self.training_sensors = []
+        self.training_actions = []
+        self.training_timestamps = []
+        self.current_left_speed = 0.0
+        self.current_right_speed = 0.0
+        self.current_head_angle = 30.0
+        self.last_drive_command_time = 0.0
+        self.current_session_name = ""
+        self.recording_task = None
 
-# --- VARIABLES GLOBALES DU MODE NN ---
-nn_active = False
-nn_task = None
-nn_model_name = ""
-nn_model = None
-sensors_mean = None
-sensors_std = None
+        self.nn_active = False
+        self.nn_task = None
+        self.nn_model_name = ""
+        self.nn_model = None
+        self.sensors_mean = None
+        self.sensors_std = None
 
-# --- VARIABLES GLOBALES DU MODE HYBRIDE ---
-hybrid_active = False
-hybrid_task = None
-hybrid_shared_state = None
+        self.hybrid_active = False
+        self.hybrid_task = None
+        self.hybrid_shared_state = None
+
+        self.baseline_active = False
+        self.baseline_task = None
+        self.baseline_shared_state = None
+
+state = CozmoStateManager()
 
 def load_model_and_stats_sync(model_name):
-    global nn_model, sensors_mean, sensors_std
     try:
         # Strip .pt if present
         model_key = model_name
         if model_key.endswith(".pt"):
             model_key = model_key[:-3]
             
-        if model_key.startswith("cozmo_nn_"):
-            suffix = model_key[len("cozmo_nn_"):]
-        else:
-            suffix = model_key
-            
         model_path = os.path.join("models", f"{model_key}.pt")
-        norm_stats_path = os.path.join("models", f"norm_stats_{suffix}.json")
+        norm_stats_path = os.path.join("models", f"norm_stats_{model_key}.json")
         
         if not os.path.exists(model_path):
             print(f"Model file not found: {model_path}")
@@ -159,14 +200,21 @@ def load_model_and_stats_sync(model_name):
         # Load stats
         with open(norm_stats_path, 'r') as f:
             stats = json.load(f)
-        sensors_mean = np.array(stats['mean'], dtype=np.float32)
-        sensors_std = np.array(stats['std'], dtype=np.float32)
+        state.sensors_mean = np.array(stats['mean'], dtype=np.float32)
+        state.sensors_std = np.array(stats['std'], dtype=np.float32)
         
         # Instantiate model
-        nn_model = CozmoNN()
+        if "discrete" in model_key:
+            if "2_3" in model_key or "2_4" in model_key:
+                num_actions = 4
+            else:
+                num_actions = 7
+            state.nn_model = CozmoNNDiscrete(sensor_dim=8, num_actions=num_actions)
+        else:
+            state.nn_model = CozmoNN()
         state_dict = torch.load(model_path, map_location=torch.device('cpu'), weights_only=True)
-        nn_model.load_state_dict(state_dict)
-        nn_model.eval()
+        state.nn_model.load_state_dict(state_dict)
+        state.nn_model.eval()
         
         return True
     except Exception as e:
@@ -174,39 +222,37 @@ def load_model_and_stats_sync(model_name):
         return False
 
 async def start_nn_mode(robot, model_name):
-    global nn_active, nn_task, nn_model_name
     if not TORCH_AVAILABLE:
         await broadcast_data({"type": "terminal_log", "message": "❌ Erreur : PyTorch n'est pas disponible.", "source": "system"})
         return
         
-    if nn_active:
+    if state.nn_active:
         return
         
     # Stop other conflicting modes
-    global training_mode_active
-    if training_mode_active:
-        training_mode_active = False
+    if state.training_mode_active:
+        state.training_mode_active = False
         await stop_recording_and_save(robot)
         
-    nn_model_name = model_name
-    nn_active = True
+    state.nn_model_name = model_name
+    state.nn_active = True
     
     loop = asyncio.get_event_loop()
     try:
         await broadcast_data({"type": "terminal_log", "message": f"🧠 Chargement du modèle {model_name}...", "source": "system"})
         success = await loop.run_in_executor(None, load_model_and_stats_sync, model_name)
         if not success:
-            nn_active = False
+            state.nn_active = False
             await broadcast_data({"type": "terminal_log", "message": f"❌ Échec du chargement du modèle {model_name}", "source": "system"})
             return
             
-        nn_task = asyncio.create_task(nn_inference_loop(robot))
+        state.nn_task = asyncio.create_task(nn_inference_loop(robot))
         await broadcast_data({"type": "terminal_log", "message": f"▶️ Mode NN démarré avec {model_name}", "source": "system"})
         # Also broadcast initial status
         await broadcast_data({
             "type": "nn_status",
             "active": True,
-            "model_name": nn_model_name,
+            "model_name": state.nn_model_name,
             "fps": 20.0,
             "inference_ms": 0.0,
             "left_speed": 0.0,
@@ -215,26 +261,25 @@ async def start_nn_mode(robot, model_name):
             "cliff_events": 0
         })
     except Exception as e:
-        nn_active = False
+        state.nn_active = False
         await broadcast_data({"type": "terminal_log", "message": f"❌ Erreur de chargement : {str(e)}", "source": "system"})
 
 async def stop_nn_mode(robot):
-    global nn_active, nn_task
-    if not nn_active:
+    if not state.nn_active:
         return
-    nn_active = False
+    state.nn_active = False
     if robot:
         try:
             await robot.stop_all_motors()
         except Exception:
             pass
             
-    if nn_task:
+    if state.nn_task:
         try:
-            await nn_task
+            await state.nn_task
         except Exception:
             pass
-        nn_task = None
+        state.nn_task = None
         
     await broadcast_data({"type": "terminal_log", "message": "⏹ Mode NN arrêté.", "source": "system"})
     await broadcast_data({
@@ -254,23 +299,23 @@ async def stop_nn_mode(robot):
 # =====================================================================
 async def start_hybrid_mode(robot, commande_utilisateur, model_name=None):
     """Démarre le mode exploration hybride NN + Gemini."""
-    global hybrid_active, hybrid_task, hybrid_shared_state
-    global training_mode_active, nn_active
 
-    if hybrid_active:
+    if state.hybrid_active:
         await broadcast_data({"type": "terminal_log", "message": "⚠️ Mode hybride déjà actif.", "source": "system"})
         return
 
     # Arrêter les modes conflictuels
-    if training_mode_active:
-        training_mode_active = False
+    if state.training_mode_active:
+        state.training_mode_active = False
         await stop_recording_and_save(robot)
-    if nn_active:
+    if state.nn_active:
         await stop_nn_mode(robot)
+    if state.baseline_active:
+        await stop_baseline_benchmark_mode()
 
-    hybrid_active = True
+    state.hybrid_active = True
     # Créer le shared_state immédiatement pour que le kill switch fonctionne
-    hybrid_shared_state = {
+    state.hybrid_shared_state = {
         "cap_cible": 0.0,
         "description_scene": "",
         "strategie": "",
@@ -283,62 +328,131 @@ async def start_hybrid_mode(robot, commande_utilisateur, model_name=None):
     await broadcast_data({"type": "terminal_log", "message": "🚀 Démarrage du mode hybride...", "source": "system"})
 
     async def _run_hybrid():
-        global hybrid_active, hybrid_shared_state
         try:
             await lancer_exploration_hybride(
                 robot, commande_utilisateur, broadcast_data,
-                model_name=model_name, shared_state=hybrid_shared_state
+                model_name=model_name, shared_state=state.hybrid_shared_state
             )
         except Exception as e:
             await broadcast_data({"type": "terminal_log", "message": "❌ Erreur mode hybride : " + str(e), "source": "system"})
         finally:
-            hybrid_active = False
-            hybrid_shared_state = None
+            state.hybrid_active = False
+            state.hybrid_shared_state = None
             await broadcast_data({"type": "hybrid_stopped"})
             await broadcast_data({"type": "terminal_log", "message": "⏹ Mode hybride arrêté.", "source": "system"})
 
-    hybrid_task = asyncio.create_task(_run_hybrid())
+    state.hybrid_task = asyncio.create_task(_run_hybrid())
 
 
 async def stop_hybrid_mode():
     """Arrête le mode hybride en activant le kill switch."""
-    global hybrid_active, hybrid_task, hybrid_shared_state
 
-    if not hybrid_active:
+    if not state.hybrid_active:
         return
 
     # Activer le kill switch pour arrêter les deux boucles
-    if hybrid_shared_state is not None:
-        hybrid_shared_state["kill_switch"] = True
+    if state.hybrid_shared_state is not None:
+        state.hybrid_shared_state["kill_switch"] = True
 
     # Attendre la fin propre
-    if hybrid_task is not None:
+    if state.hybrid_task is not None:
         try:
-            await asyncio.wait_for(hybrid_task, timeout=5.0)
+            await asyncio.wait_for(state.hybrid_task, timeout=5.0)
         except asyncio.TimeoutError:
-            hybrid_task.cancel()
+            state.hybrid_task.cancel()
             try:
-                await hybrid_task
+                await state.hybrid_task
             except (asyncio.CancelledError, Exception):
                 pass
         except Exception:
             pass
-        hybrid_task = None
+        state.hybrid_task = None
 
-    hybrid_active = False
-    hybrid_shared_state = None
+    state.hybrid_active = False
+    state.hybrid_shared_state = None
 
-    if global_robot:
+    if state.robot:
         try:
-            await global_robot.stop_all_motors()
+            await state.robot.stop_all_motors()
         except Exception:
             pass
 
     await broadcast_data({"type": "hybrid_stopped"})
 
 
+async def start_baseline_benchmark_mode(robot, commande_utilisateur):
+    """Demarre la baseline Stop-Look-Plan-Act pour le benchmark Eiffel + boite."""
+
+    if state.baseline_active:
+        await broadcast_data({"type": "terminal_log", "message": "Baseline benchmark deja actif.", "source": "system"})
+        return
+
+    if state.training_mode_active:
+        state.training_mode_active = False
+        await stop_recording_and_save(robot)
+    if state.nn_active:
+        await stop_nn_mode(robot)
+    if state.hybrid_active:
+        await stop_hybrid_mode()
+
+    state.baseline_active = True
+    state.baseline_shared_state = {"kill_switch": False}
+
+    async def _run_baseline():
+        try:
+            await lancer_benchmark_eiffel_baseline(
+                robot,
+                commande_utilisateur,
+                broadcast_data,
+                shared_state=state.baseline_shared_state,
+            )
+        except Exception as e:
+            await broadcast_data({"type": "terminal_log", "message": "Erreur baseline benchmark : " + str(e), "source": "system"})
+        finally:
+            state.baseline_active = False
+            state.baseline_shared_state = None
+            await broadcast_data({"type": "terminal_log", "message": "Baseline benchmark arrete.", "source": "system"})
+
+    state.baseline_task = asyncio.create_task(_run_baseline())
+
+
+async def stop_baseline_benchmark_mode():
+    """Arrete proprement la baseline benchmark."""
+
+    if not state.baseline_active:
+        return
+
+    if state.baseline_shared_state is not None:
+        state.baseline_shared_state["kill_switch"] = True
+
+    if state.baseline_task is not None:
+        try:
+            await asyncio.wait_for(state.baseline_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            state.baseline_task.cancel()
+            try:
+                await state.baseline_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        except Exception:
+            pass
+        state.baseline_task = None
+
+    state.baseline_active = False
+    state.baseline_shared_state = None
+
+    if state.robot:
+        try:
+            await state.robot.stop_all_motors()
+        except Exception:
+            pass
+
+
+def _infer_nn_sync(model, img_t, sens_t):
+    with torch.no_grad():
+        return model(img_t, sens_t)
+
 async def nn_inference_loop(robot):
-    global nn_active, nn_model, sensors_mean, sensors_std, nn_model_name
     loop = asyncio.get_event_loop()
     
     fps_ema = 20.0
@@ -348,7 +462,12 @@ async def nn_inference_loop(robot):
     cliff_events = 0
     watchdog_counter = 0
 
-    while nn_active:
+    STATE_NAV_NN = "NAV_NN"
+    STATE_CLIFF_ESCAPE = "CLIFF_ESCAPE"
+    current_state = STATE_NAV_NN
+    escape_frame_counter = 0
+
+    while state.nn_active:
         start_time = loop.time()
         
         # Calculate FPS
@@ -359,12 +478,26 @@ async def nn_inference_loop(robot):
             fps_ema = 0.9 * fps_ema + 0.1 * current_fps
         last_tick_time = t_now
         
-        # Sécurité anti-chute (cliff override)
-        if robot.is_cliff_detected:
-            cliff_events += 1
-            await robot.stop_all_motors()
-            await robot.drive_straight(cozmo.util.distance_mm(-50), cozmo.util.speed_mmps(50)).wait_for_completed()
-            await asyncio.sleep(0.5)
+        # --- Machine à États Finis (FSM) pour l'échappement ---
+        if current_state == STATE_NAV_NN:
+            if robot.is_cliff_detected or robot.is_picked_up:
+                robot.drive_wheels(0.0, 0.0)
+                current_state = STATE_CLIFF_ESCAPE
+                escape_frame_counter = 0
+                continue
+        elif current_state == STATE_CLIFF_ESCAPE:
+            robot.drive_wheels(-50.0, -20.0)
+            escape_frame_counter += 1
+            
+            if escape_frame_counter >= 40:
+                if robot.is_cliff_detected or robot.is_picked_up:
+                    pass # Maintien de l'état d'échappement si le danger est toujours présent
+                else:
+                    robot.drive_wheels(0.0, 0.0)
+                    current_state = STATE_NAV_NN
+                    escape_frame_counter = 0
+            
+            await asyncio.sleep(0.05)
             continue
             
         # 1. Capture image (80x60 grayscale, normalisée [0,1])
@@ -382,13 +515,20 @@ async def nn_inference_loop(robot):
             
         # 2. Capture sensory vector
         sensors = get_sensor_vector(robot)
-        
+        sensors_arr = np.array(sensors, dtype=np.float32)
+
+        # Filtrage conditionnel
+        if isinstance(state.nn_model, CozmoNNDiscrete):
+            SAFE_SENSOR_INDICES = [2, 3, 6, 7, 8, 9, 10, 11]
+            sensors_arr = sensors_arr[SAFE_SENSOR_INDICES]
+
         # 3. Normaliser les capteurs
         try:
-            sensors_normalized = (np.array(sensors, dtype=np.float32) - sensors_mean[0]) / sensors_std[0]
+            sensors_normalized = (sensors_arr - state.sensors_mean[0]) / state.sensors_std[0]
         except Exception as e:
             print(f"Normalization error: {e}")
-            sensors_normalized = np.zeros((12,), dtype=np.float32)
+            dim = 8 if isinstance(state.nn_model, CozmoNNDiscrete) else 12
+            sensors_normalized = np.zeros((dim,), dtype=np.float32)
             
         # 4. Inférence (forward pass)
         t_inf_start = time.time()
@@ -396,8 +536,26 @@ async def nn_inference_loop(robot):
             img_tensor = torch.from_numpy(img_arr).unsqueeze(0).unsqueeze(0)      # (1, 1, 60, 80)
             sensor_tensor = torch.from_numpy(sensors_normalized).unsqueeze(0)    # (1, 12)
             
-            with torch.no_grad():
-                outputs = nn_model(img_tensor, sensor_tensor)
+            outputs = await loop.run_in_executor(None, _infer_nn_sync, state.nn_model, img_tensor, sensor_tensor)
+            
+            if isinstance(state.nn_model, CozmoNNDiscrete):
+                probs = torch.softmax(outputs, dim=1)
+                max_prob, predicted_class = torch.max(probs, dim=1)
+                action_idx = predicted_class.item()
+                prob_val = max_prob.item()
+
+                if action_idx in [1, 2] and prob_val < 0.65:
+                    action_idx = 0
+                
+                speeds = {
+                    0: (50.0, 50.0),
+                    1: (-50.0, 50.0),
+                    2: (50.0, -50.0),
+                    3: (-50.0, -20.0)
+                }
+                left_speed, right_speed = speeds.get(action_idx, (0.0, 0.0))
+                head_angle = 15.0
+            else:
                 left_speed = float(outputs[0, 0].item())
                 right_speed = float(outputs[0, 1].item())
                 head_angle = float(outputs[0, 2].item())
@@ -418,7 +576,7 @@ async def nn_inference_loop(robot):
             await broadcast_data({"type": "terminal_log", "message": f"⚠️ Inférence lente : {inference_ms:.1f}ms ({watchdog_counter}/5)", "source": "system"})
             if watchdog_counter >= 5:
                 await broadcast_data({"type": "terminal_log", "message": "🚨 Arrêt d'urgence : 5 inférences lentes consécutives !", "source": "system"})
-                nn_active = False
+                state.nn_active = False
                 await robot.stop_all_motors()
                 await broadcast_data({
                     "type": "nn_status",
@@ -457,7 +615,7 @@ async def nn_inference_loop(robot):
             await broadcast_data({
                 "type": "nn_status",
                 "active": True,
-                "model_name": nn_model_name,
+                "model_name": state.nn_model_name,
                 "fps": round(fps_ema, 1),
                 "inference_ms": round(inf_ms_ema, 1),
                 "left_speed": round(left_speed, 1),
@@ -473,7 +631,6 @@ async def nn_inference_loop(robot):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    global training_mode_active, current_left_speed, current_right_speed, last_drive_command_time, current_head_angle, nn_active
     await websocket.accept()
     active_websockets.append(websocket)
     try:
@@ -483,68 +640,76 @@ async def websocket_endpoint(websocket: WebSocket):
             if msg_type == "command":
                 await command_queue.put(data.get("command"))
             elif msg_type == "training_mode":
-                training_mode_active = data.get("active", False)
-                if training_mode_active and nn_active:
-                    await stop_nn_mode(global_robot)
-                if not training_mode_active and is_recording:
-                    await stop_recording_and_save(global_robot)
+                state.training_mode_active = data.get("active", False)
+                if state.training_mode_active and state.nn_active:
+                    await stop_nn_mode(state.robot)
+                if not state.training_mode_active and state.is_recording:
+                    await stop_recording_and_save(state.robot)
             elif msg_type == "training_start":
-                await start_recording(global_robot)
+                await start_recording(state.robot)
             elif msg_type == "training_stop":
-                await stop_recording_and_save(global_robot)
+                await stop_recording_and_save(state.robot)
             elif msg_type == "training_drive":
-                current_left_speed = float(data.get("left", 0.0))
-                current_right_speed = float(data.get("right", 0.0))
-                last_drive_command_time = asyncio.get_event_loop().time()
-                if global_robot:
+                state.current_left_speed = float(data.get("left", 0.0))
+                state.current_right_speed = float(data.get("right", 0.0))
+                state.last_drive_command_time = asyncio.get_event_loop().time()
+                if state.robot:
                     try:
                         # Sécurité anti-chute en mode entraînement
-                        if global_robot.is_cliff_detected:
-                            is_backward = (current_left_speed <= 0 and current_right_speed <= 0)
-                            is_turn_in_place = (current_left_speed * current_right_speed < 0)
+                        if state.robot.is_cliff_detected:
+                            is_backward = (state.current_left_speed <= 0 and state.current_right_speed <= 0)
+                            is_turn_in_place = (state.current_left_speed * state.current_right_speed < 0)
                             if not (is_backward or is_turn_in_place):
-                                current_left_speed = 0.0
-                                current_right_speed = 0.0
-                                await global_robot.stop_all_motors()
-                        await global_robot.drive_wheels(current_left_speed, current_right_speed)
+                                state.current_left_speed = 0.0
+                                state.current_right_speed = 0.0
+                                await state.robot.stop_all_motors()
+                        await state.robot.drive_wheels(state.current_left_speed, state.current_right_speed)
                     except Exception:
                         pass
             elif msg_type == "training_head":
                 angle = float(data.get("angle", 0.0))
-                current_head_angle = angle
-                if global_robot:
+                state.current_head_angle = angle
+                if state.robot:
                     try:
-                        global_robot.set_head_angle(cozmo.util.degrees(angle), in_parallel=True)
+                        state.robot.set_head_angle(cozmo.util.degrees(angle), in_parallel=True)
                     except Exception:
                         pass
             elif msg_type == "nn_start":
                 model_name = data.get("model")
-                if global_robot:
-                    await start_nn_mode(global_robot, model_name)
+                if state.robot:
+                    await start_nn_mode(state.robot, model_name)
             elif msg_type == "nn_stop":
-                if global_robot:
-                    await stop_nn_mode(global_robot)
+                if state.robot:
+                    await stop_nn_mode(state.robot)
             elif msg_type == "hybrid_start":
                 objective = data.get("objective", "")
                 model_name = data.get("model", "") or None
-                if global_robot and objective:
-                    await start_hybrid_mode(global_robot, objective, model_name)
+                if state.robot and objective:
+                    await start_hybrid_mode(state.robot, objective, model_name)
             elif msg_type == "hybrid_stop":
                 await stop_hybrid_mode()
+            elif msg_type == "baseline_start":
+                objective = data.get("objective", "benchmark eiffel baseline")
+                if state.robot:
+                    await start_baseline_benchmark_mode(state.robot, objective)
+            elif msg_type == "baseline_stop":
+                await stop_baseline_benchmark_mode()
     except WebSocketDisconnect:
         active_websockets.remove(websocket)
         if not active_websockets:
-            if nn_active:
-                await stop_nn_mode(global_robot)
-            if hybrid_active:
+            if state.nn_active:
+                await stop_nn_mode(state.robot)
+            if state.hybrid_active:
                 await stop_hybrid_mode()
+            if state.baseline_active:
+                await stop_baseline_benchmark_mode()
 
 async def broadcast_data(data: dict):
-    for ws in list(active_websockets):
-        try:
-            await ws.send_json(data)
-        except Exception:
-            pass
+    if not active_websockets:
+        return
+    tasks = [asyncio.create_task(ws.send_json(data)) for ws in list(active_websockets)]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 # =====================================================================
 # --- FONCTIONS DU MODE ENTRAÎNEMENT ---
@@ -623,10 +788,9 @@ def get_sensor_vector(robot):
     return sensor_vector
 
 async def training_recording_loop(robot):
-    global is_recording, training_frames, training_sensors, training_actions, training_timestamps
     loop = asyncio.get_event_loop()
     
-    while is_recording:
+    while state.is_recording:
         start_time = loop.time()
         
         # 1. Capture image
@@ -647,16 +811,16 @@ async def training_recording_loop(robot):
         
         # 3. Capture actions
         actions = [
-            float(current_left_speed),
-            float(current_right_speed),
-            float(current_head_angle)
+            float(state.current_left_speed),
+            float(state.current_right_speed),
+            float(state.current_head_angle)
         ]
         
         # 4. Save to list
-        training_frames.append(img_arr)
-        training_sensors.append(sensors)
-        training_actions.append(actions)
-        training_timestamps.append(time.time())
+        state.training_frames.append(img_arr)
+        state.training_sensors.append(sensors)
+        state.training_actions.append(actions)
+        state.training_timestamps.append(time.time())
         
         # Sleep to maintain 20Hz (50ms interval)
         elapsed = loop.time() - start_time
@@ -664,53 +828,49 @@ async def training_recording_loop(robot):
         await asyncio.sleep(sleep_time)
 
 async def start_recording(robot):
-    global is_recording, training_frames, training_sensors, training_actions, training_timestamps
-    global current_session_name, recording_task
-    if is_recording or robot is None:
+    if state.is_recording or robot is None:
         return
     
-    training_frames = []
-    training_sensors = []
-    training_actions = []
-    training_timestamps = []
+    state.training_frames = []
+    state.training_sensors = []
+    state.training_actions = []
+    state.training_timestamps = []
     
     import datetime
     now_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    current_session_name = f"session_{now_str}"
-    is_recording = True
+    state.current_session_name = f"session_{now_str}"
+    state.is_recording = True
     
-    recording_task = asyncio.create_task(training_recording_loop(robot))
-    print(f"⏺ Début de l'enregistrement de la session {current_session_name}")
+    state.recording_task = asyncio.create_task(training_recording_loop(robot))
+    print(f"⏺ Début de l'enregistrement de la session {state.current_session_name}")
 
 async def stop_recording_and_save(robot):
-    global is_recording, recording_task
-    if not is_recording:
+    if not state.is_recording:
         return
     
-    is_recording = False
-    if recording_task:
+    state.is_recording = False
+    if state.recording_task:
         try:
-            await recording_task
+            await state.recording_task
         except Exception:
             pass
-        recording_task = None
+        state.recording_task = None
     
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, stop_and_save_sync)
 
 def stop_and_save_sync():
-    global training_frames, training_sensors, training_actions, training_timestamps, current_session_name
-    if not training_timestamps:
+    if not state.training_timestamps:
         print("⚠️ Aucun enregistrement à sauvegarder.")
         return
     
     os.makedirs("training_data", exist_ok=True)
-    filepath = os.path.join("training_data", f"{current_session_name}.npz")
+    filepath = os.path.join("training_data", f"{state.current_session_name}.npz")
     
-    frames_arr = np.array(training_frames, dtype=np.uint8)
-    sensors_arr = np.array(training_sensors, dtype=np.float32)
-    actions_arr = np.array(training_actions, dtype=np.float32)
-    timestamps_arr = np.array(training_timestamps, dtype=np.float64)
+    frames_arr = np.array(state.training_frames, dtype=np.uint8)
+    sensors_arr = np.array(state.training_sensors, dtype=np.float32)
+    actions_arr = np.array(state.training_actions, dtype=np.float32)
+    timestamps_arr = np.array(state.training_timestamps, dtype=np.float64)
     
     np.savez_compressed(
         filepath,
@@ -721,46 +881,45 @@ def stop_and_save_sync():
     )
     
     size_mb = os.path.getsize(filepath) / (1024.0 * 1024.0)
-    print(f"⏹ Session {current_session_name} sauvegardée avec succès: {filepath} ({size_mb:.2f} MB, {len(timestamps_arr)} frames)")
+    print(f"⏹ Session {state.current_session_name} sauvegardée avec succès: {filepath} ({size_mb:.2f} MB, {len(timestamps_arr)} frames)")
     
-    training_frames = []
-    training_sensors = []
-    training_actions = []
-    training_timestamps = []
+    state.training_frames = []
+    state.training_sensors = []
+    state.training_actions = []
+    state.training_timestamps = []
 
 async def safety_timeout_loop():
-    global current_left_speed, current_right_speed
     while True:
         await asyncio.sleep(0.05)
-        if training_mode_active:
+        if state.training_mode_active:
             now = asyncio.get_event_loop().time()
-            if now - last_drive_command_time > 0.2:
-                if current_left_speed != 0.0 or current_right_speed != 0.0:
-                    current_left_speed = 0.0
-                    current_right_speed = 0.0
+            if now - state.last_drive_command_time > 0.2:
+                if state.current_left_speed != 0.0 or state.current_right_speed != 0.0:
+                    state.current_left_speed = 0.0
+                    state.current_right_speed = 0.0
                     try:
-                        if global_robot:
-                            global_robot.drive_wheels(0.0, 0.0)
+                        if state.robot:
+                            state.robot.drive_wheels(0.0, 0.0)
                     except Exception:
                         pass
 
 async def stream_training_status():
     while True:
         await asyncio.sleep(0.5)
-        if training_mode_active:
-            if is_recording and len(training_timestamps) > 0:
-                duration = training_timestamps[-1] - training_timestamps[0]
+        if state.training_mode_active:
+            if state.is_recording and len(state.training_timestamps) > 0:
+                duration = state.training_timestamps[-1] - state.training_timestamps[0]
             else:
                 duration = 0.0
             
-            n_samples = len(training_timestamps)
+            n_samples = len(state.training_timestamps)
             raw_bytes = n_samples * (60 * 80 * 1 + 12 * 4 + 3 * 4 + 8)
             size_mb = round(raw_bytes / (1024.0 * 1024.0), 2)
             
             await broadcast_data({
                 "type": "training_status",
-                "recording": is_recording,
-                "session_name": current_session_name,
+                "recording": state.is_recording,
+                "session_name": state.current_session_name,
                 "frame_count": n_samples,
                 "duration_s": round(duration, 2),
                 "file_size_mb": size_mb
@@ -1042,8 +1201,7 @@ def generer_image_meteo(ville, temp, condition):
 # --- LE CORPS (Boucle principale) ---
 # =====================================================================
 async def cozmo_program(robot: cozmo.robot.Robot):
-    global global_robot
-    global_robot = robot
+    state.robot = robot
     robot.camera.image_stream_enabled = True
     await asyncio.sleep(1.0)
     await robot.set_head_angle(cozmo.util.degrees(30)).wait_for_completed()
@@ -1068,14 +1226,42 @@ async def cozmo_program(robot: cozmo.robot.Robot):
         question = await command_queue.get()
         print(f"⌨️ Commande reçue : {question.strip()}")
         await broadcast_data({"type": "terminal_log", "message": question.strip(), "source": "user"})
+        question_lower = question.lower().strip()
+
+        # --- Stop navigation sans quitter tout le programme ---
+        if question_lower in ["stop navigation", "stop benchmark", "arrete navigation", "arrête navigation"]:
+            if state.baseline_active:
+                await stop_baseline_benchmark_mode()
+            if state.hybrid_active:
+                await stop_hybrid_mode()
+            if state.nn_active:
+                await stop_nn_mode(robot)
+            await robot.stop_all_motors()
+            await broadcast_data({"type": "terminal_log", "message": "Navigation active arretee.", "source": "system"})
+            continue
 
         # --- Commandes de sortie ---
-        if question.lower() in ["quitter", "exit", "stop", "arrête-toi"]:
+        if question_lower in ["quitter", "exit", "stop", "arrête-toi"]:
             await robot.say_text(
                 "Désactivation vocale en cours. Au revoir.",
                 in_parallel=True
             ).wait_for_completed()
             break
+
+        # --- Benchmark reproductible Eiffel + boite ---
+        if "benchmark" in question_lower or "test eiffel" in question_lower or "test tour eiffel" in question_lower:
+            commande_complete = question.strip()
+            if "hybrid" in question_lower or "hybride" in question_lower:
+                latest_model = find_latest_model()
+                if latest_model and TORCH_AVAILABLE:
+                    await broadcast_data({"type": "terminal_log", "message": "Benchmark hybride lance.", "source": "system"})
+                    await start_hybrid_mode(robot, commande_complete, latest_model)
+                else:
+                    await broadcast_data({"type": "terminal_log", "message": "Aucun modele NN continu disponible pour le benchmark hybride.", "source": "system"})
+            else:
+                await broadcast_data({"type": "terminal_log", "message": "Benchmark baseline lance.", "source": "system"})
+                await start_baseline_benchmark_mode(robot, commande_complete)
+            continue
 
         # --- Détection du mode exploration (Waypoint Navigation) ---
         # Liste de mots-clés déclencheurs pour activer la navigation.
@@ -1083,8 +1269,6 @@ async def cozmo_program(robot: cozmo.robot.Robot):
             "va dans", "va vers", "va à", "va au",
             "explore", "dirige", "rejoins", "trouve"
         ]
-        question_lower = question.lower()
-
         mot_detecte = None
         for mot in mots_cles_nav:
             if mot in question_lower:
@@ -1093,6 +1277,11 @@ async def cozmo_program(robot: cozmo.robot.Robot):
 
         if mot_detecte:
             commande_complete = question.strip()
+
+            if "baseline" in question_lower or "fiable" in question_lower:
+                await broadcast_data({"type": "terminal_log", "message": "Mode baseline Stop-Look-Plan-Act active.", "source": "system"})
+                await start_baseline_benchmark_mode(robot, commande_complete)
+                continue
 
             # Phase 4 : routage automatique vers le mode hybride si un modèle NN est disponible
             latest_model = find_latest_model()

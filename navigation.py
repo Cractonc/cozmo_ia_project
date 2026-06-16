@@ -64,14 +64,15 @@ async def surveiller_falaise(robot):
 # =====================================================================
 # --- CERVEAU NAVIGATEUR (Chain of Thought — Gemini Cloud) ---
 # =====================================================================
-def appel_gemini_navigation_sync(image_b64, commande_complete, derniere_action,
+async def appel_gemini_navigation_async(image_b64, commande_complete, derniere_action,
                                   odometrie, historique_nav):
     """
-    Appel REST synchrone (exécuté dans un thread via run_in_executor).
+    Appel REST asynchrone via aiohttp.
     Intègre la commande complète de l'utilisateur, l'odométrie,
     la dernière action, et l'historique FIFO.
     Retourne le dict JSON Chain of Thought ou None en cas d'erreur.
     """
+    import aiohttp
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"gemini-3.1-flash-lite:generateContent?key={API_KEY}"
@@ -163,25 +164,25 @@ def appel_gemini_navigation_sync(image_b64, commande_complete, derniere_action,
     max_tentatives = 3
     delai = 2
 
-    for tentative in range(1, max_tentatives + 1):
-        try:
-            resp = requests.post(url, headers={"Content-Type": "application/json"},
-                                 json=payload, timeout=15)
-            resp.raise_for_status()
-            raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-            raw = raw.replace("```json", "").replace("```", "").strip()
-            return json.loads(raw)
-        except requests.exceptions.HTTPError as e:
-            if resp.status_code == 429 and tentative < max_tentatives:
-                import time
-                time.sleep(delai)
-                delai *= 2
-            else:
+    async with aiohttp.ClientSession() as session:
+        for tentative in range(1, max_tentatives + 1):
+            try:
+                async with session.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=15) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    raw = data["candidates"][0]["content"]["parts"][0]["text"]
+                    raw = raw.replace("```json", "").replace("```", "").strip()
+                    return json.loads(raw)
+            except aiohttp.ClientResponseError as e:
+                if e.status == 429 and tentative < max_tentatives:
+                    await asyncio.sleep(delai)
+                    delai *= 2
+                else:
+                    print(f"⚠️ Erreur API : {e}")
+                    return None
+            except Exception as e:
                 print(f"⚠️ Erreur API : {e}")
                 return None
-        except Exception as e:
-            print(f"⚠️ Erreur API : {e}")
-            return None
 
     return None
 
@@ -262,12 +263,8 @@ async def lancer_exploration(robot, commande_complete, broadcast_data=None):
         if broadcast_data:
             await broadcast_data({"type": "state_update", "state": "THINK", "session_id": session_id})
 
-        decision = await loop.run_in_executor(
-            None,
-            functools.partial(
-                appel_gemini_navigation_sync,
-                img_b64, commande_complete, derniere_action, odometrie, historique_nav
-            )
+        decision = await appel_gemini_navigation_async(
+            img_b64, commande_complete, derniere_action, odometrie, historique_nav
         )
 
         if decision is None:

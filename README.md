@@ -16,6 +16,7 @@
   - [Mode Exploration Hybride](#-mode-exploration-hybride-nn--gemini)
   - [Mode Navigation Waypoint](#-mode-navigation-waypoint-classique)
   - [Carte 3D SLAM](#-carte-3d-slam)
+- [Historique des Versions & Architecture V2.4 (Prod)](#historique-des-versions--architecture-v24-prod)
 - [Prérequis](#prérequis)
   - [Matériel](#matériel)
   - [Logiciels](#logiciels)
@@ -227,6 +228,36 @@ Visualisation Three.js en overlay fullscreen.
 - **Multi-session** : filtrage par session avec checkboxes
 - **Caméra suiveuse** : option "Suivre Cozmo" (toggle)
 - **Raycaster** : clic sur une photo → modal d'affichage
+
+---
+
+## Historique des Versions & Architecture V2.4 (Prod)
+
+La version V2.4 marque le passage de CozmoPilot à une étape de production stable. Le système a considérablement évolué depuis la V1.0 (qui s'appuyait sur un modèle continu) pour faire face aux contraintes du monde physique et au manque de données d'entraînement.
+
+Voici les avancées techniques majeures de cette release hybride (Machine Learning + Robotique Bas Niveau) :
+
+### Le Pivot Discret (Dimensionality Reduction)
+Afin de pallier le manque de données (Behavioral Cloning sur seulement 15 minutes d'entraînement), nous sommes passés d'un espace d'actions continu à un modèle de classification discret reposant sur 4 macro-classes :
+1. **Avant**
+2. **Esquive Gauche**
+3. **Esquive Droite**
+4. **Urgence / Recul**
+
+Cette réduction de dimensionnalité permet au réseau d'apprendre beaucoup plus vite et de généraliser efficacement face à de nouveaux obstacles.
+
+### Symétrie Vectorielle (Loss)
+Nous avons observé un biais de prédiction, le "Syndrome de la Toupie", où le robot avait tendance à tourner en boucle vers la droite. Pour corriger cela, un équilibrage forcé des poids dans la fonction de perte (`CrossEntropyLoss`) a été introduit. Cette symétrie vectorielle pénalise asymétriquement les erreurs pour garantir que les esquives gauche et droite soient parfaitement équiprobables face à un obstacle frontal.
+
+### Le Filtre de Confiance (Thresholding)
+L'implémentation d'un seuil algorithmique de confiance garantit un comportement stable. Si la probabilité renvoyée par le *Softmax* pour une esquive est inférieure à **65%** (le robot "doute"), l'algorithme rejette l'inférence et force la ligne droite. Ce filtrage prévient les hésitations nerveuses ou les micro-corrections inutiles.
+
+### L'Architecture de Subsumption (FSM)
+Le couronnement de la V2.4 est l'intégration d'une Machine à États Finis (FSM) non-bloquante tournant à 20 Hz. Cette architecture de "Subsumption" donne la priorité absolue aux réflexes matériels de survie :
+- Si un capteur de falaise s'active ou si le robot détecte un soulèvement, le système **bypasse totalement le CNN**.
+- Une routine de recul asymétrique (virgule) s'exécute de façon déterministe sur 40 frames avant de redonner le contrôle à l'IA.
+
+Cette séparation stricte entre *réflexe matériel* et *réflexion neuronale* assure l'intégrité physique de Cozmo dans les environnements complexes.
 
 ---
 
